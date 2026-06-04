@@ -1,12 +1,6 @@
 name: hipFile
 run-name: Kicks off several hipFile CI workflows for various platforms
 
-# In particular, this root workflow's only purpose is to allow
-# us to put our entire CI in a matrix. It has the added benefit
-# of not needing to specify our supported_platforms in multiple
-# locations.
-# We can consider moving the Pre-Checks here and passing them into
-# the CI as an input.
 on:
   pull_request:
     types: [opened, synchronize, reopened] # Defaults
@@ -25,22 +19,321 @@ permissions:
   packages: write
 
 jobs:
+  Precheck:
+    runs-on: [ubuntu-24.04]
+    outputs:
+      changed_dockerfile: ${{ steps.ci-flags.outputs.changed_dockerfile }}
+      ci_matrix: ${{ steps.matrices.outputs.ci_matrix }}
+      build_CI_images_matrix: ${{ steps.build-ci-images-matrix.outputs.build_CI_images_matrix }}
+      ci_images: ${{ steps.ci-images.outputs.ci_images }}
+      nightly_build: ${{ steps.nightly.outputs.nightly_build }}
+      nightly_rocm_version: ${{ steps.nightly.outputs.nightly_rocm_version }}
+    env:
+      # Matrix variables go here in JSON notation.
+      # '>-' strips newlines
+      SUPPORTED_PLATFORMS: >-
+        [
+          "rocky",
+          "rocky8",
+          "suse",
+          "ubuntu"
+        ]
+      ROCM_VERSIONS: >-
+        [
+          "7.2.2"
+        ]
+      # MATRIX_INCLUDE / MATRIX_EXCLUDE: extra/removed matrix entries,
+      # passed through to GHA's strategy.matrix include/exclude keys
+      # so non-rectangular combinations (e.g. ubuntu x 7.13.0 only) can
+      # be expressed without abandoning the base cross-product.
+      MATRIX_INCLUDE: >-
+        [
+          {"supported_platforms": "ubuntu", "rocm_versions": "7.13.0"},
+          {"supported_platforms": "ubuntu", "rocm_versions": "nightly"}
+        ]
+      MATRIX_EXCLUDE: >-
+        []
+    steps:
+      - name: Fetching code repository...
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          path: rocm-systems
+          sparse-checkout: |
+            projects/hipfile
+            .github/workflows
+      - name: Authenticating to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Git fetch base ref
+        working-directory: rocm-systems
+        run: git fetch origin "${GITHUB_BASE_REF}"
+      - name: Set CI Flags
+        working-directory: rocm-systems/projects/hipfile
+        id: ci-flags
+        run: |
+          echo "changed_dockerfile=$(./util/files-changed.sh "origin/${GITHUB_BASE_REF}" HEAD 'projects/hipfile/util/docker/DOCKERFILE.*')" >> "${GITHUB_OUTPUT}"
+      - name: Compute matrix configurations
+        id: matrices
+        # ci_matrix is the full strategy.matrix handed to the Linux test job.
+        # full_CI_images_matrix is the deduped catalog of every CI image this run
+        # references (for naming + pulling): GHA's matrix expansion projected down
+        # to (supported_platforms, rocm_versions) so test-only axes (CXX, compiler)
+        # don't multiply images. The build-set step below derives what to build.
+        # Note that full_CI_images_matrix is in include-only form.
+        run: |
+          ci_matrix=$(
+            jq -c --null-input \
+              --argjson supported_platforms "${SUPPORTED_PLATFORMS}" \
+              --argjson rocm_versions "${ROCM_VERSIONS}" \
+              --argjson matrix_include "${MATRIX_INCLUDE}" \
+              --argjson matrix_exclude "${MATRIX_EXCLUDE}" \
+              '{
+                supported_platforms: $supported_platforms,
+                rocm_versions: $rocm_versions,
+                include: $matrix_include,
+                exclude: $matrix_exclude
+              }'
+          )
+          echo "hipFile CI Matrix: "
+          echo "${ci_matrix}" | jq .
+          echo "ci_matrix=${ci_matrix}" >> ${GITHUB_OUTPUT}
 
-  Linux:
+          full_CI_images_matrix=$(
+            printf '%s' "${ci_matrix}" | jq -c '
+              . as $ci
+              | ($ci
+                  | with_entries(select(.key != "include" and .key != "exclude"))
+                ) as $base
+              | ($ci.include // []) as $includes
+              | ($ci.exclude // []) as $excludes
+
+              # Cross-product of all base axes (auto-extends when axes added)
+              | (reduce ($base | to_entries)[] as $axis (
+                  [{}];
+                  [ .[] as $combo
+                  | $axis.value[] as $v
+                  | $combo + { ($axis.key): $v }
+                  ]
+                )) as $cross
+
+              # Apply excludes (partial match: every pinned field must match)
+              | ($cross | map(. as $c | select(
+                  [ $excludes[] | . as $e
+                  | ($e | to_entries | all($c[.key] == .value))
+                  ] | any | not
+                ))) as $after_exclude
+
+              # Includes that cannot merge into any original combo create
+              # new combos. An include merges if none of its base-axis
+              # values would overwrite the combos value; non-base-axis
+              # fields are always mergeable.
+              | ($includes | map(select(. as $incl
+                  | [ $after_exclude[] | . as $c
+                    | ($incl | to_entries | all(
+                        ((.key as $k | $base | has($k)) | not)
+                        or ($c[.key] == .value)
+                      ))
+                    ] | any | not
+                ))) as $new_combos
+
+              # Project to image-identity axes, drop empty rows, dedupe
+              | ($after_exclude + $new_combos
+                  | map({supported_platforms, rocm_versions}
+                        | with_entries(select(.value != null)))
+                  | map(select(length > 0))
+                  | unique
+                ) as $image_pairs
+
+              | { include: $image_pairs }
+            '
+          )
+          echo "hipFile Full CI Images Matrix: "
+          echo "${full_CI_images_matrix}" | jq .
+          echo "full_CI_images_matrix=${full_CI_images_matrix}" >> ${GITHUB_OUTPUT}
+      - name: Resolve ROCm nightly metadata
+        id: nightly
+        working-directory: rocm-systems/projects/hipfile
+        env:
+          FULL_CI_IMAGES_MATRIX: ${{ steps.matrices.outputs.full_CI_images_matrix }}
+        # Only resolves when a nightly row is present; otherwise emit empty values
+        # so the downstream image-name step stays wired up unconditionally.
+        run: |
+          if printf '%s' "${FULL_CI_IMAGES_MATRIX}" \
+              | jq -e '.include[]? | select(.rocm_versions == "nightly")' >/dev/null; then
+            ./util/resolve-rocm-nightly.sh | tee -a "${GITHUB_OUTPUT}"
+          else
+            echo "nightly_build=" >> "${GITHUB_OUTPUT}"
+            echo "nightly_rocm_version=" >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Compute CI image names
+        id: ci-images
+        env:
+          REGISTRY_URL: ghcr.io/${{ github.repository_owner }}
+          CHANGED_DOCKERFILE: ${{ steps.ci-flags.outputs.changed_dockerfile }}
+          FULL_CI_IMAGES_MATRIX: ${{ steps.matrices.outputs.full_CI_images_matrix }}
+          NIGHTLY_BUILD: ${{ steps.nightly.outputs.nightly_build }}
+        run: |
+          if [ "${CHANGED_DOCKERFILE}" = "1" ]; then
+            # sanitize ref for tag
+            tag="$(echo "${GITHUB_REF}" | sed 's|[^a-zA-Z0-9]|-|g')-rocm"
+          else
+            tag="latest-rocm"
+          fi
+          # Consume full_CI_images_matrix.include directly: it is already
+          # the deduplicated set of (platform, version) pairs we name images
+          # for, derived from the full GHA-style expansion of ci_matrix.
+          # Single source of truth -- no parallel exclude/include logic
+          # here. Partial-axis include rows produce malformed image URLs
+          # (e.g. "...:latest-rocm" with no version); the resulting docker
+          # pull failure surfaces the malformed include to the maintainer.
+          #
+          # Nightly: the version axis is the literal "nightly". The image tag
+          # carries the resolved YYYYMMDD-XXX build id for diagnosability
+          # (e.g. :latest-rocm-nightly-20260602-26796279962), while the cache
+          # ref stays floating (:latest-rocm-nightly-cache) so successive
+          # nightly builds share cache layers.
+          ci_images=$(
+            jq -c -n \
+              --arg registry "${REGISTRY_URL}" \
+              --arg tag "$tag" \
+              --arg nightly_build "${NIGHTLY_BUILD}" \
+              --argjson build_matrix "${FULL_CI_IMAGES_MATRIX}" \
+              '
+                $build_matrix.include
+                | map({ platform: .supported_platforms,
+                        version:  .rocm_versions })
+                | reduce .[] as $combo (
+                    {}; . + {
+                      ($combo.platform + "-" + $combo.version): (
+                        ( $combo
+                          # Versions concatenate after the "rocm" prefix without
+                          # a separator ("latest-rocm7.2.2"). For nightly, insert
+                          # a hyphen so the tag reads "latest-rocm-nightly[-BUILD]"
+                          # rather than "latest-rocmnightly".
+                          | .version_for_tag = (if .version == "nightly" then "-nightly" else .version end)
+                          | .build_suffix    = (if .version == "nightly" and ($nightly_build | length) > 0
+                                                then "-" + $nightly_build
+                                                else "" end)
+                          | .image_name    = ($registry + "/hipfile/ais_ci_" + .platform)
+                          | .image         = (.image_name + ":" + $tag + .version_for_tag + .build_suffix)
+                          | .cache         = (.image_name + ":latest-rocm" + .version_for_tag + "-cache")
+                          | .image_nvidia  = (.image_name + ":" + $tag + .version_for_tag + .build_suffix + "-nvidia")
+                          | .cache_nvidia  = (.image_name + ":latest-rocm" + .version_for_tag + "-nvidia-cache")
+                        ) | {
+                          ci_image:              (.image        | ascii_downcase),
+                          ci_image_cache:        (.cache        | ascii_downcase),
+                          ci_image_nvidia:       (.image_nvidia | ascii_downcase),
+                          ci_image_nvidia_cache: (.cache_nvidia | ascii_downcase)
+                        }
+                      )
+                    }
+                  )
+              '
+          )
+          echo "List of CI Images: "
+          echo "${ci_images}" | jq .
+          echo "ci_images=${ci_images}" >> "${GITHUB_OUTPUT}"
+      - name: Compute images to build
+        id: build-ci-images-matrix
+        env:
+          CHANGED_DOCKERFILE: ${{ steps.ci-flags.outputs.changed_dockerfile }}
+          FULL_CI_IMAGES_MATRIX: ${{ steps.matrices.outputs.full_CI_images_matrix }}
+          CI_IMAGES: ${{ steps.ci-images.outputs.ci_images }}
+        # A Dockerfile change rebuilds the whole catalog; otherwise only nightly
+        # rows may need building (other versions reuse latest-rocm<ver> from
+        # hipfile-image-update.yml). A nightly row is built only when its
+        # base+nvidia images aren't already published by
+        # hipfile-image-update-nightly.yml -- so in the common case (no Dockerfile
+        # change, nightly already published) the build set is empty and the
+        # build_CI_image job is skipped entirely.
+        run: |
+          if [ "${CHANGED_DOCKERFILE}" = "1" ]; then
+            build_CI_images_matrix="${FULL_CI_IMAGES_MATRIX}"
+          else
+            nightly_matrix=$(
+              printf '%s' "${FULL_CI_IMAGES_MATRIX}" \
+                | jq -c '{include: [.include[] | select(.rocm_versions == "nightly")]}'
+            )
+
+            # Record which nightly images are not published in GHCR.
+            # Convert the JSON nightly keys to a Bash space-delimited string so that
+            # we can check the image refs with Docker.
+            to_build=""
+            for key in $(printf '%s' "${nightly_matrix}" \
+                | jq -r '.include[] | "\(.supported_platforms)-\(.rocm_versions)"'); do
+              img=$(printf '%s' "${CI_IMAGES}" | jq -r --arg k "${key}" '.[$k].ci_image')
+              img_nvidia=$(printf '%s' "${CI_IMAGES}" | jq -r --arg k "${key}" '.[$k].ci_image_nvidia')
+              if ! docker buildx imagetools inspect "${img}" >/dev/null 2>&1 \
+                 || ! docker buildx imagetools inspect "${img_nvidia}" >/dev/null 2>&1; then
+                echo "Nightly image not yet published, will build: ${key}"
+                to_build="${to_build}${key} "
+              fi
+            done
+
+            # The bulk of this command is to convert the Bash space-delimited
+            # string (back) to a JSON string made up of the nightly images that
+            # are not yet built.
+            build_CI_images_matrix=$(
+              printf '%s' "${nightly_matrix}" \
+                | jq -c --arg tb "${to_build}" \
+                    '($tb | split(" ") | map(select(length > 0))) as $b
+                     | {include: [.include[]
+                         | select((.supported_platforms + "-" + .rocm_versions) as $k | $b | index($k))]}'
+            )
+          fi
+          echo "hipFile Build CI Images Matrix: "
+          echo "${build_CI_images_matrix}" | jq .
+          echo "build_CI_images_matrix=${build_CI_images_matrix}" >> "${GITHUB_OUTPUT}"
+
+  build_CI_image:
+    # build_CI_images_matrix is empty when there's nothing to (re)build (no
+    # Dockerfile change and every nightly image already published). An empty
+    # include yields zero matrix jobs, so this job is skipped.
+    if: ${{ fromJSON(needs.Precheck.outputs.build_CI_images_matrix).include[0] != null }}
+    needs: Precheck
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
-      matrix:
-        supported_platforms:
-          - rocky
-          - rocky8
-          - suse
-          - ubuntu
-        rocm_versions:
-          - 7.2.2
-        include:
-          - supported_platforms: ubuntu
-            rocm_versions: 7.13.0
+      matrix: ${{ fromJSON(needs.Precheck.outputs.build_CI_images_matrix) }}
+    uses: ./.github/workflows/hipfile-image-build.yml
+    with:
+      ci_image_name: ${{ fromJSON(needs.Precheck.outputs.ci_images)[format('{0}-{1}', matrix.supported_platforms, matrix.rocm_versions)].ci_image }}
+      ci_image_cache: ${{ fromJSON(needs.Precheck.outputs.ci_images)[format('{0}-{1}', matrix.supported_platforms, matrix.rocm_versions)].ci_image_cache }}
+      ci_image_name_nvidia: ${{ fromJSON(needs.Precheck.outputs.ci_images)[format('{0}-{1}', matrix.supported_platforms, matrix.rocm_versions)].ci_image_nvidia }}
+      ci_image_cache_nvidia: ${{ fromJSON(needs.Precheck.outputs.ci_images)[format('{0}-{1}', matrix.supported_platforms, matrix.rocm_versions)].ci_image_nvidia_cache }}
+      platform: ${{ matrix.supported_platforms }}
+      # Nightly passes the resolved clean version (e.g. 7.14.0) as ROCM_VERSION
+      # and the build id separately; other versions pass the matrix value.
+      rocm_version: ${{ matrix.rocm_versions == 'nightly' && needs.Precheck.outputs.nightly_rocm_version || matrix.rocm_versions }}
+      rocm_nightly_build: ${{ matrix.rocm_versions == 'nightly' && needs.Precheck.outputs.nightly_build || '' }}
+      # Only a steady-state nightly fallback build refreshes the shared floating
+      # cache; a Dockerfile-change PR builds a PR-namespaced image and must not.
+      publish_cache: ${{ matrix.rocm_versions == 'nightly' && needs.Precheck.outputs.changed_dockerfile != '1' }}
+
+  # Due to GHA matrix limitations, we cannot inspect the result of individual jobs
+  # in the matrix. To avoid confusing errors, our only option is that if a single
+  # build fails, the entire workflow must stop. Which is rather unfortunate.
+  Linux:
+    if: >-
+      ${{
+        !cancelled() && (
+          needs.build_CI_image.result == 'success' ||
+          needs.build_CI_image.result == 'skipped'
+        )
+      }}
+    needs: [Precheck, build_CI_image]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.Precheck.outputs.ci_matrix) }}
     uses: ./.github/workflows/hipfile-ci.yml
     with:
+      ci_image: ${{ fromJSON(needs.Precheck.outputs.ci_images)[format('{0}-{1}', matrix.supported_platforms, matrix.rocm_versions)].ci_image }}
+      ci_image_nvidia: ${{ fromJSON(needs.Precheck.outputs.ci_images)[format('{0}-{1}', matrix.supported_platforms, matrix.rocm_versions)].ci_image_nvidia }}
       platform: ${{ matrix.supported_platforms }}
       rocm_version: ${{ matrix.rocm_versions }}
