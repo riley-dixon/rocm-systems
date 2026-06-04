@@ -16,7 +16,9 @@ ARG ROCM_VERSION=7.2.2
 ARG ROCM_PKG_REPO_OVERRIDE
 
 # The initial pull takes some time. Expect ~2.5 minutes to complete.
-RUN zypper refresh
+# update repositories are intermittently unavailable and are not required for this CI image.
+RUN zypper modifyrepo --disable repo-update repo-update-non-oss repo-backports-update repo-sle-update || true && \
+    zypper refresh
 
 # Setup AMD/ROCm Repositories (using AMD SLES repo)
 # Method 1: Using amdgpu_install.rpm - buggy
